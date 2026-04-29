@@ -1,0 +1,21 @@
+# Rust
+/target/
+Cargo.lock
+
+# Connor runtime files
+.connor_history.json
+*.log
+
+# Mission configs with secrets (keep connor.toml.example, ignore local)
+connor.toml
+.connor.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
