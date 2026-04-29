@@ -1,0 +1,1 @@
+/home/kael/connor/target/release/connor: /home/kael/connor/src/config.rs /home/kael/connor/src/history.rs /home/kael/connor/src/logger.rs /home/kael/connor/src/main.rs /home/kael/connor/src/runner.rs /home/kael/connor/src/webhook.rs

@@ -1,0 +1,21 @@
+[package]
+name = "connor"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "connor"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+colored = "2"
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+notify = "6"
+tokio-stream = "0.1"
