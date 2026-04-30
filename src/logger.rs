@@ -57,6 +57,18 @@ pub fn step_retry(step: &str, attempt: u32, max: u32) {
     );
 }
 
+pub fn step_output(step: &str, output: &str) {
+    if output.trim().is_empty() {
+        return;
+    }
+
+    println!("{}", format!("  ── output: {} ──", step).dimmed());
+    for line in output.lines() {
+        println!("{}", format!("  {}", line).dimmed());
+    }
+    println!("{}", "  ─────────────────────".dimmed());
+}
+
 pub fn pipeline_success(elapsed_ms: u128) {
     println!("\n{}", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".green());
     println!(

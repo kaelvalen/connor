@@ -1,11 +1,10 @@
 use crate::config::{Config, Step};
 use crate::history::{RunRecord, RunStatus, StepRecord, StepStatus};
 use crate::logger;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use colored::Colorize;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Stdio;
@@ -102,19 +101,19 @@ impl Runner {
                 let log_file = self.log_file.clone();
                 let idx = step_index;
                 let total = total_steps;
-                let retry = retry_limit;
                 let is_solo = stage.len() == 1;
+                let emit_output = is_solo;
 
                 if is_solo {
                     logger::step_start(&step.name, idx, total);
                 }
 
                 let handle = tokio::spawn(async move {
-                    let max_attempts = (step.retry.unwrap_or(0) + 1).max(1);
-                    let effective_retry = retry.min(max_attempts);
+                    let attempts_limit = max_attempts(retry_limit, step.retry);
 
                     let (success, elapsed, attempts, output) =
-                        execute_step(&step, effective_retry, log_file.as_deref()).await;
+                        execute_step(&step, attempts_limit, log_file.as_deref(), emit_output).await;
+                    let output_for_summary = output.clone();
 
                     if is_solo {
                         if success {
@@ -132,7 +131,7 @@ impl Runner {
                         output,
                     });
 
-                    (step.name.clone(), success)
+                    (step.name.clone(), success, elapsed, output_for_summary)
                 });
 
                 handles.push(handle);
@@ -140,9 +139,20 @@ impl Runner {
 
             let mut stage_failed: Option<String> = None;
             for handle in handles {
-                let (name, success) = handle.await?;
+                let (name, success, elapsed, output) = handle.await?;
                 if !success && stage_failed.is_none() {
-                    stage_failed = Some(name);
+                    stage_failed = Some(name.clone());
+                }
+                if stage.len() > 1 {
+                    if success {
+                        logger::step_success(&name, elapsed);
+                    } else {
+                        logger::step_failure(&name, None);
+                        if let Some(out) = output {
+                            let out = truncate_output(&out, 2000);
+                            logger::step_output(&name, &out);
+                        }
+                    }
                 }
             }
 
@@ -247,75 +257,171 @@ impl Runner {
 
     pub fn build_stages(&self) -> Result<Vec<Vec<Step>>> {
         let steps = &self.config.steps;
-        let mut assigned: HashMap<String, usize> = HashMap::new();
-        let mut stages: Vec<Vec<Step>> = Vec::new();
+        if steps.is_empty() {
+            return Ok(vec![]);
+        }
 
-        for step in steps {
-            let stage_idx = step
-                .depends_on
-                .as_ref()
-                .map(|deps| {
-                    deps.iter()
-                        .filter_map(|d| assigned.get(d))
-                        .copied()
-                        .max()
-                        .map(|s| s + 1)
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-
-            if stages.len() <= stage_idx {
-                stages.resize_with(stage_idx + 1, Vec::new);
+        // Validate and index steps by name.
+        let mut by_name: HashMap<&str, usize> = HashMap::with_capacity(steps.len());
+        for (idx, step) in steps.iter().enumerate() {
+            if by_name.insert(step.name.as_str(), idx).is_some() {
+                return Err(anyhow!("Duplicate step name '{}'", step.name));
             }
+        }
 
-            stages[stage_idx].push(step.clone());
-            assigned.insert(step.name.clone(), stage_idx);
+        if let Some(ref from) = self.from_step {
+            if !by_name.contains_key(from.as_str()) {
+                return Err(anyhow!(
+                    "Unknown step '{}' for --from/connor retry target",
+                    from
+                ));
+            }
+        }
+
+        // Build adjacency and indegree.
+        let mut indegree = vec![0usize; steps.len()];
+        let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); steps.len()];
+        let mut deps: Vec<Vec<usize>> = vec![Vec::new(); steps.len()];
+
+        for (idx, step) in steps.iter().enumerate() {
+            let dep_names = step.depends_on.as_deref().unwrap_or(&[]);
+            for dep in dep_names {
+                let dep_idx = *by_name
+                    .get(dep.as_str())
+                    .ok_or_else(|| anyhow!("Step '{}' depends on unknown step '{}'", step.name, dep))?;
+                if dep_idx == idx {
+                    return Err(anyhow!("Step '{}' cannot depend on itself", step.name));
+                }
+                indegree[idx] += 1;
+                outgoing[dep_idx].push(idx);
+                deps[idx].push(dep_idx);
+            }
+        }
+
+        // Kahn topo sort, deterministically preferring original order.
+        let mut ready: BTreeSet<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| (*d == 0).then_some(i))
+            .collect();
+
+        let mut topo: Vec<usize> = Vec::with_capacity(steps.len());
+        let mut in_topo = vec![false; steps.len()];
+        while let Some(&i) = ready.iter().next() {
+            ready.remove(&i);
+            topo.push(i);
+            in_topo[i] = true;
+            for &to in &outgoing[i] {
+                indegree[to] -= 1;
+                if indegree[to] == 0 {
+                    ready.insert(to);
+                }
+            }
+        }
+
+        if topo.len() != steps.len() {
+            // Remaining nodes are part of (or blocked by) a cycle.
+            let mut remaining: Vec<&str> = (0..steps.len())
+                .filter(|i| !in_topo[*i])
+                .map(|i| steps[i].name.as_str())
+                .collect();
+            remaining.sort_unstable();
+            return Err(anyhow!(
+                "Dependency cycle detected involving: {}",
+                remaining.join(", ")
+            ));
+        }
+
+        // Stage = longest path depth (max(dep_stage)+1). This yields maximal parallelism.
+        let mut stage_of = vec![0usize; steps.len()];
+        for &i in &topo {
+            let mut s = 0usize;
+            for &d in &deps[i] {
+                s = s.max(stage_of[d] + 1);
+            }
+            stage_of[i] = s;
+        }
+
+        let max_stage = *stage_of.iter().max().unwrap_or(&0);
+        let mut stages: Vec<Vec<Step>> = vec![Vec::new(); max_stage + 1];
+        for (idx, step) in steps.iter().enumerate() {
+            stages[stage_of[idx]].push(step.clone());
         }
 
         Ok(stages)
     }
 }
 
+fn max_attempts(global_retry_limit: u32, step_extra_retry: Option<u32>) -> u32 {
+    // retry_limit is "max retries per step" (i.e. additional tries after the first).
+    // step.retry adds more retries for that step.
+    1 + global_retry_limit + step_extra_retry.unwrap_or(0)
+}
+
+fn retry_backoff_ms(attempt: u32) -> u64 {
+    // attempt is 1-based; backoff applies after a failure, before attempt+1.
+    // 500ms, 1s, 2s, 4s... capped at 10s with a small deterministic jitter.
+    let pow = attempt.saturating_sub(1).min(10);
+    let base = 500u64.saturating_mul(1u64 << pow);
+    let capped = base.min(10_000);
+    let jitter = (Utc::now().timestamp_subsec_millis() as u64) % 250;
+    capped + jitter
+}
+
+fn truncate_output(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = s.chars().take(max_chars).collect::<String>();
+    out.push_str("\n… (truncated)");
+    out
+}
+
 async fn execute_step(
     step: &Step,
     max_attempts: u32,
     log_file: Option<&str>,
+    emit_output: bool,
 ) -> (bool, u128, u32, Option<String>) {
     let mut attempts = 0u32;
     let start = Instant::now();
-    let mut last_output: Option<String> = None;
 
     loop {
         attempts += 1;
-        let result = spawn_step(step, log_file).await;
+        let result = spawn_step(step, log_file, emit_output).await;
 
         match result {
             Ok((true, output)) => {
                 return (true, start.elapsed().as_millis(), attempts, Some(output));
             }
             Ok((false, output)) => {
-                last_output = Some(output);
                 if attempts < max_attempts {
                     logger::step_retry(&step.name, attempts, max_attempts);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let sleep_ms = retry_backoff_ms(attempts);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                 } else {
-                    return (false, start.elapsed().as_millis(), attempts, last_output);
+                    return (false, start.elapsed().as_millis(), attempts, Some(output));
                 }
             }
             Err(e) => {
-                last_output = Some(e.to_string());
                 if attempts < max_attempts {
                     logger::step_retry(&step.name, attempts, max_attempts);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let sleep_ms = retry_backoff_ms(attempts);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                 } else {
-                    return (false, start.elapsed().as_millis(), attempts, last_output);
+                    return (
+                        false,
+                        start.elapsed().as_millis(),
+                        attempts,
+                        Some(e.to_string()),
+                    );
                 }
             }
         }
     }
 }
 
-async fn spawn_step(step: &Step, log_file: Option<&str>) -> Result<(bool, String)> {
+async fn spawn_step(step: &Step, log_file: Option<&str>, emit_output: bool) -> Result<(bool, String)> {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
         c.args(["/C", &step.cmd]);
@@ -339,11 +445,13 @@ async fn spawn_step(step: &Step, log_file: Option<&str>) -> Result<(bool, String
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{}{}", stdout, stderr);
 
-    if !stdout.trim().is_empty() {
-        print!("{}", stdout);
-    }
-    if !stderr.trim().is_empty() {
-        eprint!("{}", stderr);
+    if emit_output {
+        if !stdout.trim().is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
     }
 
     if let Some(path) = log_file {
@@ -356,5 +464,78 @@ async fn spawn_step(step: &Step, log_file: Option<&str>) -> Result<(bool, String
     Ok((output.status.success(), combined))
 }
 
-// suppress unused import warning
-fn _use_hashset(_: HashSet<String>) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Mission, Step};
+
+    fn mk_config(steps: Vec<Step>) -> Config {
+        Config {
+            mission: Mission { name: "m".into(), target: None, retry_limit: Some(3), stop_on_failure: Some(true) },
+            steps,
+        }
+    }
+
+    #[test]
+    fn stages_parallel_then_dependent() {
+        let cfg = mk_config(vec![
+            Step { name: "lint".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+            Step { name: "test".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+            Step {
+                name: "build".into(),
+                cmd: "x".into(),
+                depends_on: Some(vec!["lint".into(), "test".into()]),
+                retry: None,
+                env: None,
+            },
+        ]);
+        let r = Runner::new(cfg, None, true, None);
+        let stages = r.build_stages().unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["lint", "test"]);
+        assert_eq!(stages[1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["build"]);
+    }
+
+    #[test]
+    fn build_stages_errors_on_unknown_dep() {
+        let cfg = mk_config(vec![Step {
+            name: "a".into(),
+            cmd: "x".into(),
+            depends_on: Some(vec!["missing".into()]),
+            retry: None,
+            env: None,
+        }]);
+        let r = Runner::new(cfg, None, true, None);
+        let err = r.build_stages().unwrap_err().to_string();
+        assert!(err.contains("depends on unknown step"));
+    }
+
+    #[test]
+    fn build_stages_errors_on_cycle() {
+        let cfg = mk_config(vec![
+            Step { name: "a".into(), cmd: "x".into(), depends_on: Some(vec!["b".into()]), retry: None, env: None },
+            Step { name: "b".into(), cmd: "x".into(), depends_on: Some(vec!["a".into()]), retry: None, env: None },
+        ]);
+        let r = Runner::new(cfg, None, true, None);
+        let err = r.build_stages().unwrap_err().to_string();
+        assert!(err.contains("Dependency cycle detected"));
+    }
+
+    #[test]
+    fn build_stages_errors_on_duplicate_names() {
+        let cfg = mk_config(vec![
+            Step { name: "a".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+            Step { name: "a".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+        ]);
+        let r = Runner::new(cfg, None, true, None);
+        let err = r.build_stages().unwrap_err().to_string();
+        assert!(err.contains("Duplicate step name"));
+    }
+
+    #[test]
+    fn retry_attempts_math() {
+        assert_eq!(max_attempts(3, None), 4);
+        assert_eq!(max_attempts(3, Some(2)), 6);
+        assert_eq!(max_attempts(0, Some(0)), 1);
+    }
+}

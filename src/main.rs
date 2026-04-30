@@ -20,8 +20,8 @@ struct Cli {
     command: Commands,
 
     /// Path to mission config
-    #[arg(short, long, default_value = "connor.toml")]
-    config: String,
+    #[arg(short, long)]
+    config: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -78,17 +78,18 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config_path = cli.config.clone().unwrap_or_else(|| config::find_config().to_string());
 
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Run { from, dry_run, log, webhook } => {
-            cmd_run(&cli.config, from, dry_run, log, webhook).await
+            cmd_run(&config_path, from, dry_run, log, webhook).await
         }
-        Commands::Retry { webhook } => cmd_retry(&cli.config, webhook).await,
+        Commands::Retry { webhook } => cmd_retry(&config_path, webhook).await,
         Commands::Status => cmd_status(),
         Commands::History { limit } => cmd_history(limit),
         Commands::Watch { path, debounce, webhook } => {
-            cmd_watch(&cli.config, &path, debounce, webhook).await
+            cmd_watch(&config_path, &path, debounce, webhook).await
         }
     }
 }
