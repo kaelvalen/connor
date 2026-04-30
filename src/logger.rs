@@ -1,15 +1,24 @@
 use colored::Colorize;
 
 pub fn banner() {
-    println!("{}", r#"
+    println!(
+        "{}",
+        r#"
    ██████╗ ██████╗ ███╗   ██╗███╗   ██╗ ██████╗ ██████╗ 
   ██╔════╝██╔═══██╗████╗  ██║████╗  ██║██╔═══██╗██╔══██╗
   ██║     ██║   ██║██╔██╗ ██║██╔██╗ ██║██║   ██║██████╔╝
   ██║     ██║   ██║██║╚██╗██║██║╚██╗██║██║   ██║██╔══██╗
   ╚██████╗╚██████╔╝██║ ╚████║██║ ╚████║╚██████╔╝██║  ██║
    ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝
-"#.red().bold());
-    println!("  {} {}\n", "RESISTANCE CI/CD".cyan().bold(), "— I'll be back.".dimmed());
+"#
+        .red()
+        .bold()
+    );
+    println!(
+        "  {} {}\n",
+        "RESISTANCE CI/CD".cyan().bold(),
+        "— I'll be back.".dimmed()
+    );
 }
 
 pub fn mission_start(name: &str, target: &str) {
@@ -70,24 +79,39 @@ pub fn step_output(step: &str, output: &str) {
 }
 
 pub fn pipeline_success(elapsed_ms: u128) {
-    println!("\n{}", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".green());
+    println!(
+        "\n{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".green()
+    );
     println!(
         "  {} {}",
         "✓ JUDGMENT DAY AVERTED.".green().bold(),
         format!("Total: {}ms", elapsed_ms).dimmed()
     );
-    println!("{}", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n".green());
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n".green()
+    );
 }
 
 pub fn pipeline_failure(failed_step: &str) {
-    println!("\n{}", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".red());
+    println!(
+        "\n{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".red()
+    );
     println!(
         "  {} {}",
         "✗ SKYNET WINS.".red().bold(),
         format!("Failed at: {}", failed_step).white()
     );
-    println!("  {}", "Connor is down. Use `connor retry` to send resistance.".dimmed());
-    println!("{}", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n".red());
+    println!(
+        "  {}",
+        "Connor is down. Use `connor retry` to send resistance.".dimmed()
+    );
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n".red()
+    );
 }
 
 pub fn info(msg: &str) {

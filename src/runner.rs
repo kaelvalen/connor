@@ -32,7 +32,12 @@ impl Runner {
         dry_run: bool,
         log_file: Option<String>,
     ) -> Self {
-        Self { config, from_step, dry_run, log_file }
+        Self {
+            config,
+            from_step,
+            dry_run,
+            log_file,
+        }
     }
 
     pub async fn run(&self) -> Result<RunResult> {
@@ -125,7 +130,11 @@ impl Runner {
 
                     records_clone.lock().await.push(StepRecord {
                         name: step.name.clone(),
-                        status: if success { StepStatus::Success } else { StepStatus::Failed },
+                        status: if success {
+                            StepStatus::Success
+                        } else {
+                            StepStatus::Failed
+                        },
                         elapsed_ms: elapsed,
                         attempts,
                         output,
@@ -201,7 +210,10 @@ impl Runner {
         let stages = self.build_stages()?;
         let mission = &self.config.mission;
 
-        println!("{}", "DRY RUN — No commands will be executed\n".yellow().bold());
+        println!(
+            "{}",
+            "DRY RUN — No commands will be executed\n".yellow().bold()
+        );
 
         for (i, stage) in stages.iter().enumerate() {
             if stage.len() > 1 {
@@ -252,7 +264,10 @@ impl Runner {
             elapsed_ms: 0,
         };
 
-        Ok(RunResult { success: true, record })
+        Ok(RunResult {
+            success: true,
+            record,
+        })
     }
 
     pub fn build_stages(&self) -> Result<Vec<Vec<Step>>> {
@@ -286,9 +301,9 @@ impl Runner {
         for (idx, step) in steps.iter().enumerate() {
             let dep_names = step.depends_on.as_deref().unwrap_or(&[]);
             for dep in dep_names {
-                let dep_idx = *by_name
-                    .get(dep.as_str())
-                    .ok_or_else(|| anyhow!("Step '{}' depends on unknown step '{}'", step.name, dep))?;
+                let dep_idx = *by_name.get(dep.as_str()).ok_or_else(|| {
+                    anyhow!("Step '{}' depends on unknown step '{}'", step.name, dep)
+                })?;
                 if dep_idx == idx {
                     return Err(anyhow!("Step '{}' cannot depend on itself", step.name));
                 }
@@ -421,7 +436,11 @@ async fn execute_step(
     }
 }
 
-async fn spawn_step(step: &Step, log_file: Option<&str>, emit_output: bool) -> Result<(bool, String)> {
+async fn spawn_step(
+    step: &Step,
+    log_file: Option<&str>,
+    emit_output: bool,
+) -> Result<(bool, String)> {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
         c.args(["/C", &step.cmd]);
@@ -471,7 +490,12 @@ mod tests {
 
     fn mk_config(steps: Vec<Step>) -> Config {
         Config {
-            mission: Mission { name: "m".into(), target: None, retry_limit: Some(3), stop_on_failure: Some(true) },
+            mission: Mission {
+                name: "m".into(),
+                target: None,
+                retry_limit: Some(3),
+                stop_on_failure: Some(true),
+            },
             steps,
         }
     }
@@ -479,8 +503,20 @@ mod tests {
     #[test]
     fn stages_parallel_then_dependent() {
         let cfg = mk_config(vec![
-            Step { name: "lint".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
-            Step { name: "test".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+            Step {
+                name: "lint".into(),
+                cmd: "x".into(),
+                depends_on: None,
+                retry: None,
+                env: None,
+            },
+            Step {
+                name: "test".into(),
+                cmd: "x".into(),
+                depends_on: None,
+                retry: None,
+                env: None,
+            },
             Step {
                 name: "build".into(),
                 cmd: "x".into(),
@@ -492,8 +528,20 @@ mod tests {
         let r = Runner::new(cfg, None, true, None);
         let stages = r.build_stages().unwrap();
         assert_eq!(stages.len(), 2);
-        assert_eq!(stages[0].iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["lint", "test"]);
-        assert_eq!(stages[1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["build"]);
+        assert_eq!(
+            stages[0]
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lint", "test"]
+        );
+        assert_eq!(
+            stages[1]
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["build"]
+        );
     }
 
     #[test]
@@ -513,8 +561,20 @@ mod tests {
     #[test]
     fn build_stages_errors_on_cycle() {
         let cfg = mk_config(vec![
-            Step { name: "a".into(), cmd: "x".into(), depends_on: Some(vec!["b".into()]), retry: None, env: None },
-            Step { name: "b".into(), cmd: "x".into(), depends_on: Some(vec!["a".into()]), retry: None, env: None },
+            Step {
+                name: "a".into(),
+                cmd: "x".into(),
+                depends_on: Some(vec!["b".into()]),
+                retry: None,
+                env: None,
+            },
+            Step {
+                name: "b".into(),
+                cmd: "x".into(),
+                depends_on: Some(vec!["a".into()]),
+                retry: None,
+                env: None,
+            },
         ]);
         let r = Runner::new(cfg, None, true, None);
         let err = r.build_stages().unwrap_err().to_string();
@@ -524,8 +584,20 @@ mod tests {
     #[test]
     fn build_stages_errors_on_duplicate_names() {
         let cfg = mk_config(vec![
-            Step { name: "a".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
-            Step { name: "a".into(), cmd: "x".into(), depends_on: None, retry: None, env: None },
+            Step {
+                name: "a".into(),
+                cmd: "x".into(),
+                depends_on: None,
+                retry: None,
+                env: None,
+            },
+            Step {
+                name: "a".into(),
+                cmd: "x".into(),
+                depends_on: None,
+                retry: None,
+                env: None,
+            },
         ]);
         let r = Runner::new(cfg, None, true, None);
         let err = r.build_stages().unwrap_err().to_string();

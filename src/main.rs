@@ -78,30 +78,44 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.clone().unwrap_or_else(|| config::find_config().to_string());
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| config::find_config().to_string());
 
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Run { from, dry_run, log, webhook } => {
-            cmd_run(&config_path, from, dry_run, log, webhook).await
-        }
+        Commands::Run {
+            from,
+            dry_run,
+            log,
+            webhook,
+        } => cmd_run(&config_path, from, dry_run, log, webhook).await,
         Commands::Retry { webhook } => cmd_retry(&config_path, webhook).await,
         Commands::Status => cmd_status(),
         Commands::History { limit } => cmd_history(limit),
-        Commands::Watch { path, debounce, webhook } => {
-            cmd_watch(&config_path, &path, debounce, webhook).await
-        }
+        Commands::Watch {
+            path,
+            debounce,
+            webhook,
+        } => cmd_watch(&config_path, &path, debounce, webhook).await,
     }
 }
 
 fn cmd_init() -> Result<()> {
     let path = "connor.toml";
     if std::path::Path::new(path).exists() {
-        println!("{}", "Mission briefing already exists: connor.toml".yellow());
+        println!(
+            "{}",
+            "Mission briefing already exists: connor.toml".yellow()
+        );
         return Ok(());
     }
     std::fs::write(path, Config::default_toml())?;
-    println!("{}", "✓ Mission briefing created: connor.toml".green().bold());
+    println!(
+        "{}",
+        "✓ Mission briefing created: connor.toml".green().bold()
+    );
     println!("{}", "  Edit it and run `connor run` to begin.".dimmed());
     Ok(())
 }
@@ -142,7 +156,10 @@ async fn cmd_retry(config_path: &str, webhook: Option<String>) -> Result<()> {
 
     match failed_step {
         None => {
-            println!("{}", "No failed missions in history. Resistance is holding.".green());
+            println!(
+                "{}",
+                "No failed missions in history. Resistance is holding.".green()
+            );
         }
         Some(step) => {
             println!(
@@ -162,7 +179,10 @@ fn cmd_status() -> Result<()> {
 
     match history.first() {
         None => {
-            println!("{}", "No mission history found. Run `connor run` first.".dimmed());
+            println!(
+                "{}",
+                "No mission history found. Run `connor run` first.".dimmed()
+            );
         }
         Some(run) => {
             println!("\n{}", "━━━ LAST MISSION STATUS ━━━".cyan().bold());
@@ -170,7 +190,10 @@ fn cmd_status() -> Result<()> {
             println!(
                 "{} {}",
                 "Time:   ".dimmed(),
-                run.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string().dimmed()
+                run.timestamp
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+                    .dimmed()
             );
             println!("{} {}ms", "Elapsed:".dimmed(), run.elapsed_ms);
 
@@ -231,7 +254,11 @@ fn cmd_history(limit: usize) -> Result<()> {
             RunStatus::Failed(_) => "✗ SKYNET ".red().bold(),
         };
 
-        let steps_ok = run.steps.iter().filter(|s| s.status == StepStatus::Success).count();
+        let steps_ok = run
+            .steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Success)
+            .count();
         let steps_total = run
             .steps
             .iter()
@@ -276,7 +303,9 @@ async fn cmd_watch(
     watcher.watch(std::path::Path::new(watch_path), RecursiveMode::Recursive)?;
 
     // Run once immediately
-    cmd_run(config_path, None, false, None, webhook.clone()).await.ok();
+    cmd_run(config_path, None, false, None, webhook.clone())
+        .await
+        .ok();
 
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_run = Instant::now();
@@ -286,10 +315,7 @@ async fn cmd_watch(
             Ok(Ok(event)) => {
                 // filter to meaningful events only
                 use notify::EventKind::*;
-                let relevant = matches!(
-                    event.kind,
-                    Create(_) | Modify(_) | Remove(_)
-                );
+                let relevant = matches!(event.kind, Create(_) | Modify(_) | Remove(_));
 
                 if !relevant {
                     continue;
