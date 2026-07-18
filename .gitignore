@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 
 # Connor runtime files
 .connor_history.json
