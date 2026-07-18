@@ -14,7 +14,7 @@ use runner::Runner;
 #[derive(Parser)]
 #[command(name = "connor")]
 #[command(about = "Resistance CI/CD — I'll be back.")]
-#[command(version = "0.1.0")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
