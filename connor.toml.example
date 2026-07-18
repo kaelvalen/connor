@@ -1,0 +1,27 @@
+# Copy to connor.toml and edit — or run `connor init`.
+
+[mission]
+name = "operation-cleanup"
+target = "production"
+retry_limit = 3        # extra tries per step, on top of the first attempt
+stop_on_failure = true # halt the pipeline on the first failed step
+
+[[steps]]
+name = "lint"
+cmd = "cargo clippy -- -D warnings"
+
+[[steps]]
+name = "test"
+cmd = "cargo test"
+
+[[steps]]
+name = "build"
+cmd = "cargo build --release"
+depends_on = ["lint", "test"] # lint and test run in parallel first
+retry = 2                     # extra retries for this step only
+
+[[steps]]
+name = "deploy"
+cmd = "rsync -av target/release/app user@host:/opt/app"
+depends_on = ["build"]
+env = { DEPLOY_TOKEN = "secret", TARGET_HOST = "prod-01" }
