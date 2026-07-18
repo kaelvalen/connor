@@ -118,6 +118,8 @@ impl Runner {
 
                     let (success, elapsed, attempts, output) =
                         execute_step(&step, attempts_limit, log_file.as_deref(), emit_output).await;
+                    // keep history bounded even when steps are chatty
+                    let output = output.map(|o| truncate_output(&o, 4000));
                     let output_for_summary = output.clone();
 
                     if is_solo {
@@ -403,35 +405,20 @@ async fn execute_step(
 
     loop {
         attempts += 1;
-        let result = spawn_step(step, log_file, emit_output).await;
+        let (ok, output) = match spawn_step(step, log_file, emit_output).await {
+            Ok(pair) => pair,
+            Err(e) => (false, e.to_string()),
+        };
 
-        match result {
-            Ok((true, output)) => {
-                return (true, start.elapsed().as_millis(), attempts, Some(output));
-            }
-            Ok((false, output)) => {
-                if attempts < max_attempts {
-                    logger::step_retry(&step.name, attempts, max_attempts);
-                    let sleep_ms = retry_backoff_ms(attempts);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
-                } else {
-                    return (false, start.elapsed().as_millis(), attempts, Some(output));
-                }
-            }
-            Err(e) => {
-                if attempts < max_attempts {
-                    logger::step_retry(&step.name, attempts, max_attempts);
-                    let sleep_ms = retry_backoff_ms(attempts);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
-                } else {
-                    return (
-                        false,
-                        start.elapsed().as_millis(),
-                        attempts,
-                        Some(e.to_string()),
-                    );
-                }
-            }
+        if ok {
+            return (true, start.elapsed().as_millis(), attempts, Some(output));
+        }
+        if attempts < max_attempts {
+            logger::step_retry(&step.name, attempts, max_attempts);
+            let sleep_ms = retry_backoff_ms(attempts);
+            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+        } else {
+            return (false, start.elapsed().as_millis(), attempts, Some(output));
         }
     }
 }
