@@ -1,7 +1,12 @@
 [package]
 name = "connor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Terminal-native CI/CD pipeline runner — TOML config, DAG-parallel execution, no server"
+license = "MIT"
+repository = "https://github.com/kaelvalen/connor"
+keywords = ["ci", "cd", "pipeline", "cli", "devops"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "connor"
@@ -16,6 +21,5 @@ anyhow = "1"
 colored = "2"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 notify = "6"
-tokio-stream = "0.1"
