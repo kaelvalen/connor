@@ -1,15 +1,18 @@
 mod config;
+mod env;
 mod history;
 mod logger;
 mod runner;
 mod webhook;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use colored::Colorize;
 use config::Config;
 use history::{load_history, save_run, RunStatus, StepStatus};
 use runner::Runner;
+use std::io;
 
 #[derive(Parser)]
 #[command(name = "connor")]
@@ -20,7 +23,7 @@ struct Cli {
     command: Commands,
 
     /// Path to mission config
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<String>,
 }
 
@@ -43,6 +46,14 @@ enum Commands {
         /// Webhook URL to notify on completion
         #[arg(long)]
         webhook: Option<String>,
+
+        /// Override mission retry_limit
+        #[arg(long)]
+        retry_limit: Option<u32>,
+
+        /// Override mission target
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Retry from last failed step
     Retry {
@@ -50,12 +61,28 @@ enum Commands {
         #[arg(long)]
         webhook: Option<String>,
     },
+    /// Validate the mission config (graph, deps, env file)
+    Validate,
     /// Show pipeline status from last run
-    Status,
+    Status {
+        /// Output raw JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Show run history
     History {
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Output raw JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
     },
     /// Initialize a new connor.toml
     Init,
@@ -78,10 +105,11 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(|| config::find_config().to_string());
+    let config_path = cli.config.clone().unwrap_or_else(|| {
+        config::find_config()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "connor.toml".into())
+    });
 
     match cli.command {
         Commands::Init => cmd_init(),
@@ -90,10 +118,25 @@ async fn main() -> Result<()> {
             dry_run,
             log,
             webhook,
-        } => cmd_run(&config_path, from, dry_run, log, webhook).await,
+            retry_limit,
+            target,
+        } => {
+            cmd_run(
+                &config_path,
+                from,
+                dry_run,
+                log,
+                webhook,
+                retry_limit,
+                target,
+            )
+            .await
+        }
         Commands::Retry { webhook } => cmd_retry(&config_path, webhook).await,
-        Commands::Status => cmd_status(),
-        Commands::History { limit } => cmd_history(limit),
+        Commands::Validate => cmd_validate(&config_path),
+        Commands::Status { json } => cmd_status(json),
+        Commands::History { limit, json } => cmd_history(limit, json),
+        Commands::Completions { shell } => cmd_completions(shell),
         Commands::Watch {
             path,
             debounce,
@@ -120,16 +163,27 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     config_path: &str,
     from: Option<String>,
     dry_run: bool,
     log: Option<String>,
     webhook: Option<String>,
+    retry_limit: Option<u32>,
+    target: Option<String>,
 ) -> Result<()> {
     logger::banner();
 
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
+
+    if let Some(limit) = retry_limit {
+        config.mission.retry_limit = Some(limit);
+    }
+    if let Some(target) = target {
+        config.mission.target = Some(target);
+    }
+
     let runner = Runner::new(config, from, dry_run, log);
     let result = runner.run().await?;
 
@@ -167,15 +221,95 @@ async fn cmd_retry(config_path: &str, webhook: Option<String>) -> Result<()> {
                 "↺ SENDING RESISTANCE —".yellow().bold(),
                 step.cyan().bold()
             );
-            cmd_run(config_path, Some(step), false, None, webhook).await?;
+            cmd_run(config_path, Some(step), false, None, webhook, None, None).await?;
         }
     }
 
     Ok(())
 }
 
-fn cmd_status() -> Result<()> {
+fn cmd_validate(config_path: &str) -> Result<()> {
+    logger::banner();
+    let config = Config::load(config_path)?;
+    println!(
+        "{} {}",
+        "◈ MISSION:".yellow().bold(),
+        config.mission.name.white().bold()
+    );
+    if let Some(target) = &config.mission.target {
+        println!("{} {}", "◈ TARGET: ".yellow().bold(), target.cyan());
+    }
+
+    let runner = Runner::new(config.clone(), None, true, None);
+    let stages = runner.build_stages()?;
+
+    let total: usize = stages.iter().map(|s| s.len()).sum();
+    println!(
+        "  {} {} steps across {} stages — graph OK",
+        "✓".green().bold(),
+        total,
+        stages.len()
+    );
+
+    for (i, stage) in stages.iter().enumerate() {
+        if stage.len() > 1 {
+            println!(
+                "    {} {}",
+                format!("Stage {} [parallel]:", i + 1).cyan(),
+                stage
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                    .white()
+            );
+        } else {
+            println!(
+                "    {} {}",
+                format!("Stage {}:", i + 1).cyan(),
+                stage[0].name.white()
+            );
+        }
+    }
+
+    if config.mission.env_file.is_some() {
+        let base = config
+            .base_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let p = base.join(config.mission.env_file.as_deref().unwrap());
+        if p.is_file() {
+            println!("  {} env_file: {}", "✓".green().bold(), p.display());
+        } else {
+            println!(
+                "  {} env_file configured but missing: {}",
+                "✗".red().bold(),
+                p.display()
+            );
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+fn cmd_completions(shell: Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "connor", &mut io::stdout());
+    Ok(())
+}
+
+fn cmd_status(json: bool) -> Result<()> {
     let history = load_history();
+
+    if json {
+        let value = match history.first() {
+            Some(run) => serde_json::to_value(run)?,
+            None => serde_json::json!(null),
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
 
     match history.first() {
         None => {
@@ -238,8 +372,14 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn cmd_history(limit: usize) -> Result<()> {
+fn cmd_history(limit: usize, json: bool) -> Result<()> {
     let history = load_history();
+
+    if json {
+        let value: Vec<_> = history.into_iter().take(limit).collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
 
     if history.is_empty() {
         println!("{}", "No missions in the logs.".dimmed());
@@ -303,7 +443,7 @@ async fn cmd_watch(
     watcher.watch(std::path::Path::new(watch_path), RecursiveMode::Recursive)?;
 
     // Run once immediately
-    cmd_run(config_path, None, false, None, webhook.clone())
+    cmd_run(config_path, None, false, None, webhook.clone(), None, None)
         .await
         .ok();
 
@@ -341,7 +481,7 @@ async fn cmd_watch(
                     logger::watch_trigger(&path.to_string_lossy());
                 }
 
-                cmd_run(config_path, None, false, None, webhook.clone())
+                cmd_run(config_path, None, false, None, webhook.clone(), None, None)
                     .await
                     .ok();
             }

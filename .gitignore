@@ -9,6 +9,10 @@
 connor.toml
 .connor.toml
 
+# Environment files (loaded for ${VAR} interpolation)
+.env
+.env.*
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,4 +1,5 @@
 use crate::config::{Config, Step};
+use crate::env::{interpolate, parse_env_file, redact};
 use crate::history::{RunRecord, RunStatus, StepRecord, StepStatus};
 use crate::logger;
 use anyhow::{anyhow, Result};
@@ -9,15 +10,17 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 pub struct Runner {
     pub config: Config,
     pub from_step: Option<String>,
     pub dry_run: bool,
     pub log_file: Option<String>,
+    env_file: HashMap<String, String>,
 }
 
 pub struct RunResult {
@@ -32,11 +35,13 @@ impl Runner {
         dry_run: bool,
         log_file: Option<String>,
     ) -> Self {
+        let env_file = load_env_file(&config);
         Self {
             config,
             from_step,
             dry_run,
             log_file,
+            env_file,
         }
     }
 
@@ -45,6 +50,7 @@ impl Runner {
         let target = mission.target.clone().unwrap_or_else(|| "unknown".into());
         let retry_limit = mission.retry_limit.unwrap_or(3);
         let stop_on_failure = mission.stop_on_failure.unwrap_or(true);
+        let mission_timeout = mission.timeout_secs;
 
         logger::mission_start(&mission.name, &target);
 
@@ -104,10 +110,13 @@ impl Runner {
                 let step = step.clone();
                 let records_clone = Arc::clone(&step_records);
                 let log_file = self.log_file.clone();
+                let env_file = self.env_file.clone();
+                let base_dir = self.config.base_dir.clone();
                 let idx = step_index;
                 let total = total_steps;
                 let is_solo = stage.len() == 1;
                 let emit_output = is_solo;
+                let timeout_secs = step.timeout_secs.or(mission_timeout);
 
                 if is_solo {
                     logger::step_start(&step.name, idx, total);
@@ -115,14 +124,39 @@ impl Runner {
 
                 let handle = tokio::spawn(async move {
                     let attempts_limit = max_attempts(retry_limit, step.retry);
+                    let (lookup, secrets) = resolve_step_env(&step, &env_file);
 
-                    let (success, elapsed, attempts, output) =
-                        execute_step(&step, attempts_limit, log_file.as_deref(), emit_output).await;
+                    // Resolve relative cwd against the config directory so the
+                    // behavior is identical no matter where `connor` is invoked
+                    // from (config is found by walking up).
+                    let mut step_eff = step.clone();
+                    if let Some(resolved) =
+                        resolve_cwd(step.cwd.as_deref(), base_dir.as_deref(), &lookup)
+                    {
+                        step_eff.cwd = Some(resolved);
+                    }
+
+                    let (success, elapsed, attempts, output, timed_out) = execute_step(
+                        &step_eff,
+                        attempts_limit,
+                        log_file.as_deref(),
+                        emit_output,
+                        timeout_secs,
+                        &secrets,
+                        &lookup,
+                    )
+                    .await;
                     // keep history bounded even when steps are chatty
                     let output = output.map(|o| truncate_output(&o, 4000));
                     let output_for_summary = output.clone();
 
                     if is_solo {
+                        if timed_out {
+                            logger::warn(&format!(
+                                "Step '{}' exceeded its time limit and was terminated",
+                                step.name
+                            ));
+                        }
                         if success {
                             logger::step_success(&step.name, elapsed);
                         } else {
@@ -244,6 +278,16 @@ impl Runner {
                 }
                 if let Some(retry) = step.retry {
                     println!("  {} {}", "retry:".dimmed(), retry.to_string().yellow());
+                }
+                if let Some(cwd) = &step.cwd {
+                    println!("  {} {}", "cwd:".dimmed(), cwd.yellow());
+                }
+                if let Some(timeout) = step.timeout_secs {
+                    println!(
+                        "  {} {}s",
+                        "timeout:".dimmed(),
+                        timeout.to_string().yellow()
+                    );
                 }
             }
             println!();
@@ -369,6 +413,79 @@ impl Runner {
     }
 }
 
+/// Resolve a step's `cwd` against the config directory (relative paths) or
+/// leave absolute paths untouched. `None` when the step has no cwd.
+fn resolve_cwd(
+    cwd: Option<&str>,
+    base_dir: Option<&std::path::Path>,
+    lookup: &HashMap<String, String>,
+) -> Option<String> {
+    let cwd = cwd?;
+    let p = std::path::PathBuf::from(interpolate(cwd, lookup));
+    let resolved = if p.is_absolute() {
+        p
+    } else if let Some(base) = base_dir {
+        base.join(p)
+    } else {
+        p
+    };
+    Some(resolved.to_string_lossy().into_owned())
+}
+
+fn load_env_file(config: &Config) -> HashMap<String, String> {
+    let Some(base) = config.base_dir.as_deref() else {
+        return HashMap::new();
+    };
+    let path = match &config.mission.env_file {
+        Some(name) => {
+            let p = base.join(name);
+            if !p.is_file() {
+                logger::warn(&format!("Configured env_file not found: {}", p.display()));
+            }
+            p
+        }
+        None => base.join(".env"),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => parse_env_file(&content).into_iter().collect(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Build the interpolation lookup table (process env, then env_file, then the
+/// step's own env, which wins) and the list of secret values to redact from
+/// output (env_file and step env values of at least 4 chars).
+fn resolve_step_env(
+    step: &Step,
+    env_file: &HashMap<String, String>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut base: HashMap<String, String> = std::env::vars().collect();
+    base.extend(env_file.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    let mut secrets: Vec<String> = Vec::new();
+    for value in env_file.values() {
+        if value.len() >= 4 {
+            secrets.push(value.clone());
+        }
+    }
+
+    if let Some(env) = &step.env {
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        for (key, value) in env {
+            let value = interpolate(value, &base);
+            if value.len() >= 4 {
+                secrets.push(value.clone());
+            }
+            resolved.insert(key.clone(), value);
+        }
+        base.extend(resolved);
+    }
+
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets.dedup();
+    (base, secrets)
+}
+
 fn max_attempts(global_retry_limit: u32, step_extra_retry: Option<u32>) -> u32 {
     // retry_limit is "max retries per step" (i.e. additional tries after the first).
     // step.retry adds more retries for that step.
@@ -394,70 +511,193 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_step(
     step: &Step,
     max_attempts: u32,
     log_file: Option<&str>,
     emit_output: bool,
-) -> (bool, u128, u32, Option<String>) {
+    timeout_secs: Option<u64>,
+    secrets: &[String],
+    lookup: &HashMap<String, String>,
+) -> (bool, u128, u32, Option<String>, bool) {
     let mut attempts = 0u32;
     let start = Instant::now();
 
     loop {
         attempts += 1;
-        let (ok, output) = match spawn_step(step, log_file, emit_output).await {
-            Ok(pair) => pair,
-            Err(e) => (false, e.to_string()),
-        };
+        let (ok, output, timed_out) =
+            match spawn_step(step, log_file, emit_output, timeout_secs, secrets, lookup).await {
+                Ok((ok, output, timed_out)) => (ok, output, timed_out),
+                Err(e) => (false, e.to_string(), false),
+            };
 
         if ok {
-            return (true, start.elapsed().as_millis(), attempts, Some(output));
+            return (
+                true,
+                start.elapsed().as_millis(),
+                attempts,
+                Some(output),
+                false,
+            );
         }
         if attempts < max_attempts {
             logger::step_retry(&step.name, attempts, max_attempts);
             let sleep_ms = retry_backoff_ms(attempts);
             tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
         } else {
-            return (false, start.elapsed().as_millis(), attempts, Some(output));
+            return (
+                false,
+                start.elapsed().as_millis(),
+                attempts,
+                Some(output),
+                timed_out,
+            );
         }
     }
 }
 
+/// Spawn a step, streaming output live (when `emit_output`), capturing it for
+/// history, and enforcing an optional per-attempt timeout. On Unix the child
+/// runs in its own process group so a timeout can kill the whole tree
+/// (shell + grandchildren like docker/cargo). Secrets are redacted from both
+/// live output and the captured buffer.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_step(
     step: &Step,
     log_file: Option<&str>,
     emit_output: bool,
-) -> Result<(bool, String)> {
+    timeout_secs: Option<u64>,
+    secrets: &[String],
+    lookup: &HashMap<String, String>,
+) -> Result<(bool, String, bool)> {
+    let cmd_str = interpolate(&step.cmd, lookup);
+    let cwd = step.cwd.as_deref().map(|c| interpolate(c, lookup));
+
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", &step.cmd]);
+        c.args(["/C", &cmd_str]);
         c
     } else {
         let mut c = Command::new("sh");
-        c.args(["-c", &step.cmd]);
+        c.args(["-c", &cmd_str]);
         c
     };
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    if let Some(dir) = &cwd {
+        cmd.current_dir(dir);
+    }
+
+    // Own process group so the whole tree can be killed on timeout.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     if let Some(ref env_vars) = step.env {
         for (k, v) in env_vars {
-            cmd.env(k, v);
+            cmd.env(k, interpolate(v, lookup));
         }
     }
 
-    let output = cmd.output().await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{}{}", stdout, stderr);
+    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    let child_pid = child.id().expect("spawned child has a pid") as i32;
 
-    if emit_output {
-        if !stdout.trim().is_empty() {
-            print!("{}", stdout);
+    let (tx, mut rx) = mpsc::channel::<(u8, String)>(64);
+
+    let mut readers = Vec::new();
+    if let Some(stream) = child.stdout.take() {
+        let tx = tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send((0u8, line.clone())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    if let Some(stream) = child.stderr.take() {
+        let tx = tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send((1u8, line.clone())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    // Single consumer serializes writes (no interleaved lines) and redacts
+    // secrets before anything reaches the terminal or the capture buffer.
+    let secrets = secrets.to_vec();
+    let printer = tokio::spawn(async move {
+        let mut buf: Vec<String> = Vec::new();
+        while let Some((kind, line)) = rx.recv().await {
+            let (line, _) = redact(&line, &secrets);
+            if emit_output {
+                if kind == 0 {
+                    print!("{}", line);
+                    let _ = std::io::stdout().flush();
+                } else {
+                    eprint!("{}", line);
+                    let _ = std::io::stderr().flush();
+                }
+            }
+            buf.push(line);
         }
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
+        buf
+    });
+
+    let (status, timed_out) = match timeout_secs {
+        Some(secs) => {
+            let wait = child.wait();
+            match tokio::time::timeout(Duration::from_secs(secs), wait).await {
+                Ok(result) => (result?, false),
+                Err(_) => {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-child_pid, libc::SIGKILL);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.start_kill();
+                    }
+                    let _ = child.wait().await;
+                    // Placeholder status; `timed_out` forces failure below.
+                    (std::process::ExitStatus::default(), true)
+                }
+            }
         }
+        None => (child.wait().await?, false),
+    };
+
+    for reader in readers {
+        let _ = reader.await;
+    }
+    let mut combined = printer.await.unwrap_or_default().join("");
+    if timed_out {
+        combined.push_str(&format!(
+            "\n[connor] timed out after {}s and was terminated",
+            timeout_secs.unwrap_or(0)
+        ));
     }
 
     if let Some(path) = log_file {
@@ -467,7 +707,7 @@ async fn spawn_step(
         }
     }
 
-    Ok((output.status.success(), combined))
+    Ok((status.success() && !timed_out, combined, timed_out))
 }
 
 #[cfg(test)]
@@ -482,9 +722,28 @@ mod tests {
                 target: None,
                 retry_limit: Some(3),
                 stop_on_failure: Some(true),
+                env_file: None,
+                timeout_secs: None,
             },
             steps,
+            base_dir: None,
         }
+    }
+
+    fn mk_step(name: &str) -> Step {
+        Step {
+            name: name.into(),
+            cmd: "true".into(),
+            depends_on: None,
+            retry: None,
+            env: None,
+            cwd: None,
+            timeout_secs: None,
+        }
+    }
+
+    fn empty_lookup() -> HashMap<String, String> {
+        HashMap::new()
     }
 
     #[test]
@@ -496,6 +755,8 @@ mod tests {
                 depends_on: None,
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
             Step {
                 name: "test".into(),
@@ -503,6 +764,8 @@ mod tests {
                 depends_on: None,
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
             Step {
                 name: "build".into(),
@@ -510,6 +773,8 @@ mod tests {
                 depends_on: Some(vec!["lint".into(), "test".into()]),
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
         ]);
         let r = Runner::new(cfg, None, true, None);
@@ -539,6 +804,8 @@ mod tests {
             depends_on: Some(vec!["missing".into()]),
             retry: None,
             env: None,
+            cwd: None,
+            timeout_secs: None,
         }]);
         let r = Runner::new(cfg, None, true, None);
         let err = r.build_stages().unwrap_err().to_string();
@@ -554,6 +821,8 @@ mod tests {
                 depends_on: Some(vec!["b".into()]),
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
             Step {
                 name: "b".into(),
@@ -561,6 +830,8 @@ mod tests {
                 depends_on: Some(vec!["a".into()]),
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
         ]);
         let r = Runner::new(cfg, None, true, None);
@@ -577,6 +848,8 @@ mod tests {
                 depends_on: None,
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
             Step {
                 name: "a".into(),
@@ -584,6 +857,8 @@ mod tests {
                 depends_on: None,
                 retry: None,
                 env: None,
+                cwd: None,
+                timeout_secs: None,
             },
         ]);
         let r = Runner::new(cfg, None, true, None);
@@ -596,5 +871,238 @@ mod tests {
         assert_eq!(max_attempts(3, None), 4);
         assert_eq!(max_attempts(3, Some(2)), 6);
         assert_eq!(max_attempts(0, Some(0)), 1);
+    }
+
+    #[test]
+    fn max_attempts_is_one_for_no_retries() {
+        let step = mk_step("a");
+        let (ok, _elapsed, attempts, _out, timed_out) = tokio_test_block_on(execute_step(
+            &step,
+            1,
+            None,
+            false,
+            None,
+            &[],
+            &empty_lookup(),
+        ));
+        assert!(ok);
+        assert_eq!(attempts, 1);
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn timeout_kills_step_and_marks_timed_out() {
+        let step = Step {
+            name: "slow".into(),
+            cmd: "sleep 30".into(),
+            depends_on: None,
+            retry: None,
+            env: None,
+            cwd: None,
+            timeout_secs: Some(1),
+        };
+        let (ok, elapsed, attempts, output, timed_out) = tokio_test_block_on(execute_step(
+            &step,
+            1,
+            None,
+            false,
+            Some(1),
+            &[],
+            &empty_lookup(),
+        ));
+        assert!(!ok);
+        assert!(timed_out);
+        assert_eq!(attempts, 1);
+        // Generous bound: the point is that it was killed at ~1s, not that it
+        // survived the full 30s. The bound is loose so CPU starvation in
+        // parallel test runs can't make this flaky.
+        assert!(elapsed < 10_000, "killed at ~1s, took {elapsed}ms");
+        assert!(
+            output
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out after 1s"),
+            "output should mention the timeout: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn timeout_applies_per_attempt() {
+        let step = Step {
+            name: "flaky".into(),
+            cmd: "sleep 5".into(),
+            depends_on: None,
+            retry: Some(1),
+            env: None,
+            cwd: None,
+            timeout_secs: Some(1),
+        };
+        let (_ok, _elapsed, attempts, _out, _timed_out) = tokio_test_block_on(execute_step(
+            &step,
+            2,
+            None,
+            false,
+            Some(1),
+            &[],
+            &empty_lookup(),
+        ));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn interpolates_env_file_vars_into_cmd() {
+        let step = Step {
+            name: "echo".into(),
+            cmd: "printf '%s' ${FROM_FILE}".into(),
+            depends_on: None,
+            retry: None,
+            env: None,
+            cwd: None,
+            timeout_secs: None,
+        };
+        let lookup = HashMap::from([("FROM_FILE".to_string(), "interpolated".to_string())]);
+        let (ok, output, _timed_out) =
+            tokio_test_block_on(spawn_step(&step, None, false, None, &[], &lookup)).unwrap();
+        assert!(ok);
+        assert_eq!(output, "interpolated");
+    }
+
+    #[test]
+    fn step_env_wins_over_lookup() {
+        let step = Step {
+            name: "echo".into(),
+            cmd: "printf '%s' ${FOO}".into(),
+            depends_on: None,
+            retry: None,
+            env: Some(HashMap::from([("FOO".to_string(), "step".to_string())])),
+            cwd: None,
+            timeout_secs: None,
+        };
+        // In production the lookup is pre-merged by resolve_step_env, so the
+        // step's own value wins; here we pass that merged map directly.
+        let lookup = HashMap::from([("FOO".to_string(), "step".to_string())]);
+        let (ok, output, _timed_out) =
+            tokio_test_block_on(spawn_step(&step, None, false, None, &[], &lookup)).unwrap();
+        assert!(ok);
+        assert_eq!(output, "step");
+    }
+
+    #[test]
+    fn cwd_is_applied_to_command() {
+        let dir = std::env::temp_dir().join(format!("connor-cwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let step = Step {
+            name: "pwd".into(),
+            cmd: "pwd".into(),
+            depends_on: None,
+            retry: None,
+            env: None,
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            timeout_secs: None,
+        };
+        let (ok, output, _timed_out) =
+            tokio_test_block_on(spawn_step(&step, None, false, None, &[], &empty_lookup()))
+                .unwrap();
+        assert!(ok);
+        let expected = dir.canonicalize().unwrap();
+        assert!(
+            output.contains(expected.to_str().unwrap()),
+            "output should contain cwd: {:?}",
+            output
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn secrets_are_redacted_from_captured_output() {
+        let step = Step {
+            name: "leak".into(),
+            cmd: "echo value=supersecret123".into(),
+            depends_on: None,
+            retry: None,
+            env: None,
+            cwd: None,
+            timeout_secs: None,
+        };
+        let secrets = vec!["supersecret123".to_string()];
+        let (ok, output, _timed_out) = tokio_test_block_on(spawn_step(
+            &step,
+            None,
+            false,
+            None,
+            &secrets,
+            &empty_lookup(),
+        ))
+        .unwrap();
+        assert!(ok);
+        assert!(
+            output.contains("***"),
+            "output should be redacted: {:?}",
+            output
+        );
+        assert!(!output.contains("supersecret123"));
+    }
+
+    #[test]
+    fn resolve_cwd_joins_relative_path_onto_base_dir() {
+        let lookup = empty_lookup();
+        let base = std::path::Path::new("/project");
+        assert_eq!(
+            resolve_cwd(Some("backend"), Some(base), &lookup).as_deref(),
+            Some("/project/backend")
+        );
+        assert_eq!(
+            resolve_cwd(Some("/abs/path"), Some(base), &lookup).as_deref(),
+            Some("/abs/path")
+        );
+        assert_eq!(
+            resolve_cwd(
+                Some("${DIR}"),
+                Some(base),
+                &HashMap::from([("DIR".to_string(), "sub".to_string())])
+            )
+            .as_deref(),
+            Some("/project/sub")
+        );
+        assert_eq!(resolve_cwd(None, Some(base), &lookup), None);
+    }
+
+    #[test]
+    fn resolve_step_env_collects_secrets_from_env_file_and_step() {
+        let step = Step {
+            name: "s".into(),
+            cmd: "x".into(),
+            depends_on: None,
+            retry: None,
+            env: Some(HashMap::from([
+                ("TOKEN".to_string(), "${FILE_TOKEN}".to_string()),
+                ("SHORT".to_string(), "ab".to_string()),
+            ])),
+            cwd: None,
+            timeout_secs: None,
+        };
+        let file = HashMap::from([
+            ("FILE_TOKEN".to_string(), "file-token-value".to_string()),
+            ("SHORT_FILE".to_string(), "cd".to_string()),
+        ]);
+        let (lookup, secrets) = resolve_step_env(&step, &file);
+        assert_eq!(
+            lookup.get("TOKEN").map(String::as_str),
+            Some("file-token-value")
+        );
+        assert_eq!(lookup.get("SHORT").map(String::as_str), Some("ab"));
+        assert!(secrets.contains(&"file-token-value".to_string()));
+        assert!(!secrets.contains(&"cd".to_string()));
+        assert!(!secrets.contains(&"ab".to_string()));
+    }
+
+    #[cfg(test)]
+    fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
     }
 }

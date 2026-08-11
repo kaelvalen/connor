@@ -1,10 +1,14 @@
 # Copy to connor.toml and edit — or run `connor init`.
+# Secrets: never commit real values. Use env_file + ${VAR} interpolation
+# (see the deploy step below) — values are redacted from output/history.
 
 [mission]
 name = "operation-cleanup"
 target = "production"
-retry_limit = 3        # extra tries per step, on top of the first attempt
-stop_on_failure = true # halt the pipeline on the first failed step
+retry_limit = 3          # extra tries per step, on top of the first attempt
+stop_on_failure = true   # halt the pipeline on the first failed step
+timeout_secs = 600       # default per-step timeout; steps may override
+env_file = ".env"        # KEY=VALUE pairs for ${VAR} interpolation (default: .env)
 
 [[steps]]
 name = "lint"
@@ -19,9 +23,11 @@ name = "build"
 cmd = "cargo build --release"
 depends_on = ["lint", "test"] # lint and test run in parallel first
 retry = 2                     # extra retries for this step only
+timeout_secs = 300            # override the mission default for this step
+cwd = "backend"               # run in a subdirectory (monorepo friendly)
 
 [[steps]]
 name = "deploy"
 cmd = "rsync -av target/release/app user@host:/opt/app"
 depends_on = ["build"]
-env = { DEPLOY_TOKEN = "secret", TARGET_HOST = "prod-01" }
+env = { DEPLOY_TOKEN = "${DEPLOY_TOKEN}", TARGET_HOST = "prod-01" }
